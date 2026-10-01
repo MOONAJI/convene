@@ -1,0 +1,125 @@
+-- | Assertion visibility — bukti teknis klaim privasi selektif Convene
+-- (lihat tabel visibility di ARCHITECTURE.md bagian 4).
+module Test.Visibility where
+
+import DA.Assert
+import DA.Foldable (forA_)
+import Daml.Script
+
+import Convene
+import Test.Common
+
+-- | Tiap investor cuma lihat Vote miliknya; FundManager & Auditor lihat semua.
+testVoteNotVisibleToOtherInvestors : Script ()
+testVoteNotVisibleToOtherInvestors = do
+  ps <- allocateTestParties
+  proposalCid <- proposeDeal ps
+  _ <- castDefaultVotes ps proposalCid
+
+  forA_ (investorsOf ps) $ \inv -> do
+    votes <- query @Vote inv
+    map (\(_, v) -> v.investor) votes === [inv]
+
+  fmVotes <- query @Vote ps.fundManager
+  length fmVotes === 3
+  auditorVotes <- query @Vote ps.auditor
+  length auditorVotes === 3
+  platformVotes <- query @Vote ps.platform
+  platformVotes === []
+
+  -- VoteReceipt (bukti "sudah vote") juga privat per investor
+  forA_ (investorsOf ps) $ \inv -> do
+    receipts <- query @VoteReceipt inv
+    map (\(_, r) -> r.investor) receipts === [inv]
+  fmReceipts <- query @VoteReceipt ps.fundManager
+  length fmReceipts === 3
+  auditorReceipts <- query @VoteReceipt ps.auditor
+  length auditorReceipts === 3
+
+-- | CapitalCallNotice & Contribution privat per investor.
+testCapitalCallNoticeNotVisibleToOtherInvestors : Script ()
+testCapitalCallNoticeNotVisibleToOtherInvestors = do
+  deal <- runToApprovedDeal
+  let ps = deal.parties
+  _ <- issueCapitalCall ps deal.resultCid
+
+  forA_ (investorsOf ps) $ \inv -> do
+    notices <- query @CapitalCallNotice inv
+    map (\(_, n) -> n.investor) notices === [inv]
+
+  fmNotices <- query @CapitalCallNotice ps.fundManager
+  length fmNotices === 3
+  auditorNotices <- query @CapitalCallNotice ps.auditor
+  length auditorNotices === 3
+  platformNotices <- query @CapitalCallNotice ps.platform
+  platformNotices === []
+
+  _ <- contributeAll ps
+  forA_ (investorsOf ps) $ \inv -> do
+    contributions <- query @Contribution inv
+    map (\(_, c) -> c.investor) contributions === [inv]
+  fmContributions <- query @Contribution ps.fundManager
+  length fmContributions === 3
+  auditorContributions <- query @Contribution ps.auditor
+  length auditorContributions === 3
+
+-- | Investor lain tidak bisa memakai notice investor lain (bahkan tidak bisa melihatnya).
+testInvestorCannotContributeWithOthersNotice : Script ()
+testInvestorCannotContributeWithOthersNotice = do
+  deal <- runToApprovedDeal
+  let ps = deal.parties
+  (_, _, noticeCids) <- issueCapitalCall ps deal.resultCid
+  investor1Notice <- query @CapitalCallNotice ps.investor1
+  case investor1Notice of
+    [(noticeCid, _)] -> do
+      submitMustFail ps.investor2 do exerciseCmd noticeCid Contribute
+      assertMsg "notice id should come from IssueCapitalCall" (noticeCid `elem` noticeCids)
+    _ -> fail "Expected exactly one notice for investor1"
+
+-- | DistributionNotice privat per investor; PlatformFeeRecord tidak terlihat investor.
+testDistributionAndFeeVisibility : Script ()
+testDistributionAndFeeVisibility = do
+  deal <- runToFundedDeal
+  let ps = deal.parties
+  _ <- triggerExit deal
+
+  forA_ (investorsOf ps) $ \inv -> do
+    notices <- query @DistributionNotice inv
+    map (\(_, n) -> n.investor) notices === [inv]
+    fees <- query @PlatformFeeRecord inv
+    fees === []
+
+  fmNotices <- query @DistributionNotice ps.fundManager
+  length fmNotices === 3
+  auditorNotices <- query @DistributionNotice ps.auditor
+  length auditorNotices === 3
+
+  fmFees <- query @PlatformFeeRecord ps.fundManager
+  length fmFees === 1
+  auditorFees <- query @PlatformFeeRecord ps.auditor
+  length auditorFees === 1
+  platformFees <- query @PlatformFeeRecord ps.platform
+  length platformFees === 1
+
+-- | Kontrak agregat terlihat semua investor + auditor, tanpa breakdown per-LP.
+testAggregatesVisibleToAll : Script ()
+testAggregatesVisibleToAll = do
+  deal <- runToFundedDeal
+  let ps = deal.parties
+      viewers = ps.fundManager :: ps.auditor :: investorsOf ps
+
+  forA_ viewers $ \p -> do
+    results <- query @DealResult p
+    length results === 1
+    summaries <- query @CapitalCallSummary p
+    length summaries === 1
+    ledgers <- query @FundLedger p
+    length ledgers === 1
+
+  _ <- triggerExit deal
+  forA_ viewers $ \p -> do
+    distSummaries <- query @DistributionSummary p
+    length distSummaries === 1
+
+  platformResults <- query @DealResult ps.platform
+  platformResults === []

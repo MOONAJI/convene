@@ -1,0 +1,149 @@
+-- | Fixture bersama untuk test Convene: alokasi party dan helper tiap tahap alur.
+module Test.Common where
+
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Convene
+
+data TestParties = TestParties
+  with
+    fundManager : Party
+    investor1   : Party
+    investor2   : Party
+    investor3   : Party
+    auditor     : Party
+    platform    : Party
+
+investorsOf : TestParties -> [Party]
+investorsOf ps = [ps.investor1, ps.investor2, ps.investor3]
+
+testDealId : Text
+testDealId = "deal-1"
+
+-- | Nominal capital call per investor dan total target deal.
+callAmountPerInvestor : Decimal
+callAmountPerInvestor = 100000.0
+
+testTargetCapital : Decimal
+testTargetCapital = 300000.0
+
+-- | Pakai `allocateParty` (tanpa hint tetap) supaya script bisa dijalankan ulang
+-- di ledger live tanpa bentrok dengan party dari init script `Setup:setupConvene`.
+allocateTestParties : Script TestParties
+allocateTestParties = do
+  fundManager <- allocateParty "FundManager"
+  investor1   <- allocateParty "Investor1"
+  investor2   <- allocateParty "Investor2"
+  investor3   <- allocateParty "Investor3"
+  auditor     <- allocateParty "Auditor"
+  platform    <- allocateParty "Platform"
+  pure TestParties with ..
+
+setupPlatformAgreement : TestParties -> Script (ContractId PlatformAgreement)
+setupPlatformAgreement ps = do
+  offerCid <- submit ps.platform do
+    createCmd PlatformServiceOffer with
+      platform    = ps.platform
+      fundManager = ps.fundManager
+      auditor     = ps.auditor
+      feeRate     = defaultPlatformFeeRate
+  submit ps.fundManager do
+    exerciseCmd offerCid AcceptPlatformService
+
+proposeDeal : TestParties -> Script (ContractId DealProposal)
+proposeDeal ps = do
+  now <- getTime
+  submit ps.fundManager do
+    createCmd DealProposal with
+      fundManager   = ps.fundManager
+      investors     = investorsOf ps
+      auditor       = ps.auditor
+      dealId        = testDealId
+      description   = "Seed round startup X"
+      targetCapital = testTargetCapital
+      voteDeadline  = addRelTime now (days 7)
+
+castVote : ContractId DealProposal -> Party -> Bool -> Script (ContractId Vote)
+castVote proposalCid investor approve =
+  submit investor do
+    exerciseCmd proposalCid CastVote with investor, approve
+
+-- | Investor1 & Investor2 setuju, Investor3 menolak -> deal Approved (2/3).
+castDefaultVotes : TestParties -> ContractId DealProposal -> Script [ContractId Vote]
+castDefaultVotes ps proposalCid = do
+  v1 <- castVote proposalCid ps.investor1 True
+  v2 <- castVote proposalCid ps.investor2 True
+  v3 <- castVote proposalCid ps.investor3 False
+  pure [v1, v2, v3]
+
+tallyVotes : TestParties -> ContractId DealProposal -> [ContractId Vote] -> Script (ContractId DealResult)
+tallyVotes ps proposalCid voteCids =
+  submit ps.fundManager do
+    exerciseCmd proposalCid TallyVotes with voteCids
+
+defaultCallAmounts : TestParties -> [CallAmount]
+defaultCallAmounts ps = map (\inv -> CallAmount with investor = inv, amount = callAmountPerInvestor) (investorsOf ps)
+
+issueCapitalCall : TestParties -> ContractId DealResult -> Script (ContractId CapitalCallSummary, ContractId FundLedger, [ContractId CapitalCallNotice])
+issueCapitalCall ps resultCid =
+  submit ps.fundManager do
+    exerciseCmd resultCid IssueCapitalCall with callAmounts = defaultCallAmounts ps
+
+-- | Tiap investor setor pakai CapitalCallNotice miliknya sendiri
+-- (dicari dari sudut pandang investor itu — dia cuma bisa lihat punyanya).
+contribute : Party -> Script (ContractId Contribution)
+contribute investor = do
+  notices <- query @CapitalCallNotice investor
+  case notices of
+    [(noticeCid, _)] -> submit investor do exerciseCmd noticeCid Contribute
+    _ -> fail ("Expected exactly one CapitalCallNotice for " <> show investor)
+
+contributeAll : TestParties -> Script [ContractId Contribution]
+contributeAll ps = mapA contribute (investorsOf ps)
+
+-- | Tahap-tahap alur, supaya test bisa berhenti di titik yang dibutuhkan.
+data ApprovedDeal = ApprovedDeal
+  with
+    parties      : TestParties
+    agreementCid : ContractId PlatformAgreement
+    resultCid    : ContractId DealResult
+
+runToApprovedDeal : Script ApprovedDeal
+runToApprovedDeal = do
+  ps <- allocateTestParties
+  agreementCid <- setupPlatformAgreement ps
+  proposalCid <- proposeDeal ps
+  voteCids <- castDefaultVotes ps proposalCid
+  resultCid <- tallyVotes ps proposalCid voteCids
+  pure ApprovedDeal with parties = ps, agreementCid, resultCid
+
+data FundedDeal = FundedDeal
+  with
+    parties          : TestParties
+    agreementCid     : ContractId PlatformAgreement
+    fundLedgerCid    : ContractId FundLedger
+    contributionCids : [ContractId Contribution]
+
+runToFundedDeal : Script FundedDeal
+runToFundedDeal = do
+  deal <- runToApprovedDeal
+  let ps = deal.parties
+  _ <- issueCapitalCall ps deal.resultCid
+  contributionCids <- contributeAll ps
+  ledgers <- query @FundLedger ps.fundManager
+  case ledgers of
+    [(fundLedgerCid, _)] ->
+      pure FundedDeal with parties = ps, agreementCid = deal.agreementCid, fundLedgerCid, contributionCids
+    _ -> fail "Expected exactly one active FundLedger"
+
+testExitAmount : Decimal
+testExitAmount = 450000.0
+
+triggerExit : FundedDeal -> Script (ContractId PlatformFeeRecord, ContractId DistributionSummary, [ContractId DistributionNotice])
+triggerExit deal =
+  submit deal.parties.fundManager do
+    exerciseCmd deal.fundLedgerCid TriggerExit with
+      exitAmount           = testExitAmount
+      platformAgreementCid = deal.agreementCid
+      contributionCids     = deal.contributionCids

@@ -1,0 +1,12 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+/.daml
+build
+node_modules
+
+*.log
+
+ui/daml.js
+
+# Output Tailwind CLI (di-generate oleh npm start/build)
+ui/src/styles/generated.css

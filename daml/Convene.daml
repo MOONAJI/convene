@@ -1,0 +1,516 @@
+-- | Model inti Convene: investment club sebagai DAO privat yang auditable.
+--
+-- Alur: Propose Deal -> Vote -> Tally -> Capital Call -> Contribute -> Exit/Distribution.
+-- Tabel visibility lengkap ada di ARCHITECTURE.md bagian 4.
+--
+-- Catatan privasi PENTING (pola dipakai berulang di modul ini):
+-- Di model ledger Daml, informee sebuah *consuming* exercise = semua stakeholder
+-- kontrak (termasuk observer), dan informee sebuah action ikut melihat SELURUH
+-- sub-transaksi di bawahnya. Jadi choice yang membuat/menyentuh kontrak privat
+-- (Vote, CapitalCallNotice, DistributionNotice, PlatformFeeRecord) TIDAK BOLEH
+-- dijalankan sebagai consuming choice di kontrak yang observer-nya semua investor
+-- (DealProposal, DealResult, FundLedger) — kalau begitu, detail privat investor
+-- lain ikut ter-divulge. Solusinya: choice dibuat `nonconsuming` (informee cuma
+-- signatory + controller) lalu kontrak di-archive eksplisit lewat `archive self`.
+module Convene where
+
+import DA.Foldable (forA_)
+import DA.List (sort)
+import DA.Optional (isNone)
+
+-- | Tarif fee Platform default (1% dari nilai exit / AUM saat distribusi).
+-- Nilai efektif yang dipakai adalah `feeRate` di `PlatformAgreement`, yang
+-- disepakati Platform + FundManager di ledger. Konstanta ini dipakai init script.
+defaultPlatformFeeRate : Decimal
+defaultPlatformFeeRate = 0.01
+
+-- | True kalau tidak ada elemen duplikat.
+allDistinct : Ord a => [a] -> Bool
+allDistinct xs = let sorted = sort xs in and (zipWith (/=) sorted (drop 1 sorted))
+
+-- | Nominal capital call untuk satu investor.
+data CallAmount = CallAmount
+  with
+    investor : Party
+    amount   : Decimal
+  deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- Platform: kesepakatan fee antara Platform (Convene) dan FundManager
+-- ---------------------------------------------------------------------------
+
+-- | Penawaran layanan dari Platform ke FundManager (propose/accept pattern),
+-- dibutuhkan supaya `PlatformFeeRecord` bisa ditandatangani Platform + FundManager.
+template PlatformServiceOffer
+  with
+    platform    : Party
+    fundManager : Party
+    auditor     : Party
+    feeRate     : Decimal
+  where
+    signatory platform
+    observer fundManager, auditor
+    ensure feeRate >= 0.0 && feeRate < 1.0
+
+    choice AcceptPlatformService : ContractId PlatformAgreement
+      controller fundManager
+      do
+        create PlatformAgreement with
+          platform
+          fundManager
+          auditor
+          feeRate
+
+-- | Kesepakatan fee aktif. Sumber otoritas Platform saat fee dipotong di `TriggerExit`.
+template PlatformAgreement
+  with
+    platform    : Party
+    fundManager : Party
+    auditor     : Party
+    feeRate     : Decimal
+  where
+    signatory platform, fundManager
+    observer auditor
+    ensure feeRate >= 0.0 && feeRate < 1.0
+
+    nonconsuming choice RecordPlatformFee : (ContractId PlatformFeeRecord, Decimal)
+      with
+        dealId      : Text
+        grossAmount : Decimal
+      controller fundManager
+      do
+        assertMsg "Gross amount must be positive" (grossAmount > 0.0)
+        let feeAmount = grossAmount * feeRate
+        feeCid <- create PlatformFeeRecord with
+          fundManager
+          platform
+          auditor
+          dealId
+          grossAmount
+          feeRate
+          feeAmount
+        pure (feeCid, feeAmount)
+
+-- ---------------------------------------------------------------------------
+-- 1. DealProposal
+-- ---------------------------------------------------------------------------
+
+-- Catatan `voteDeadline` (BUSINESSRULES.md bagian 2): `ensure` di Daml bersifat pure
+-- (tidak bisa baca waktu ledger), jadi "deadline harus di masa depan" tidak bisa
+-- dicek saat create. Ditegakkan di `CastVote` (vote ditolak kalau deadline lewat):
+-- proposal dengan deadline di masa lalu tidak bisa di-vote dan hasil tally-nya
+-- otomatis Rejected (0 suara). Frontend tetap wajib validasi sebelum submit.
+template DealProposal
+  with
+    fundManager   : Party
+    investors     : [Party]
+    auditor       : Party
+    dealId        : Text
+    description   : Text
+    targetCapital : Decimal
+    voteDeadline  : Time
+  where
+    signatory fundManager
+    observer investors, auditor
+    ensure targetCapital > 0.0
+      && not (null investors)
+      && allDistinct investors
+      && fundManager `notElem` investors
+
+    key (fundManager, dealId) : (Party, Text)
+    maintainer key._1
+
+    -- Nonconsuming: informee cuma FundManager + investor yang vote, jadi
+    -- investor lain tidak ikut melihat kontrak Vote yang dibuat.
+    nonconsuming choice CastVote : ContractId Vote
+      with
+        investor : Party
+        approve  : Bool
+      controller investor
+      do
+        assertMsg "Investor must be part of this deal" (investor `elem` investors)
+        now <- getTime
+        assertMsg "Voting period has ended" (now < voteDeadline)
+        existing <- lookupByKey @Vote (investor, fundManager, dealId)
+        assertMsg "Investor has already voted on this deal" (existing == None)
+        _ <- create VoteReceipt with fundManager, investor, auditor, dealId
+        create Vote with
+          fundManager
+          investor
+          auditor
+          dealId
+          approve
+
+    -- Nonconsuming + `archive self`: lihat catatan privasi di header modul.
+    nonconsuming choice TallyVotes : ContractId DealResult
+      with
+        voteCids : [ContractId Vote]
+      controller fundManager
+      do
+        assertMsg "Duplicate vote contract ids" (allDistinct voteCids)
+        votes <- forA voteCids $ \voteCid -> do
+          v <- fetch voteCid
+          assertMsg "Vote belongs to a different deal"
+            (v.fundManager == fundManager && v.dealId == dealId)
+          assertMsg "Vote cast by a non-member" (v.investor `elem` investors)
+          _ <- exercise voteCid ConsumeVote
+          _ <- exerciseByKey @VoteReceipt (fundManager, dealId, v.investor) Archive
+          pure v
+        let voters = map (\v -> v.investor) votes
+        assertMsg "Duplicate voter" (allDistinct voters)
+        -- FundManager tidak boleh membuang vote yang sudah masuk (mis. cuma
+        -- menyertakan vote setuju setelah deadline): investor yang tidak ada di
+        -- `voteCids` harus benar-benar belum vote.
+        forA_ (filter (`notElem` voters) investors) $ \inv -> do
+          omitted <- lookupByKey @VoteReceipt (fundManager, dealId, inv)
+          assertMsg "Every cast vote must be included in the tally" (isNone omitted)
+        now <- getTime
+        assertMsg "Voting still open: wait for the deadline or for all investors to vote"
+          (now >= voteDeadline || length votes == length investors)
+        archive self
+        let approveCount = length (filter (\v -> v.approve) votes)
+            totalVotes   = length votes
+            rejectCount  = totalVotes - approveCount
+        create DealResult with
+          fundManager
+          investors
+          auditor
+          dealId
+          description
+          targetCapital
+          -- FINAL (BUSINESSRULES.md bagian 3): 1 LP 1 vote, simple majority dari
+          -- suara yang masuk; seri = Rejected. Tanpa quorum (scope cut MVP).
+          approved          = approveCount > rejectCount
+          approveCount
+          rejectCount
+          totalVotes
+          capitalCallIssued = False
+
+-- ---------------------------------------------------------------------------
+-- 2. Vote (privat per-investor)
+-- ---------------------------------------------------------------------------
+
+template Vote
+  with
+    fundManager : Party
+    investor    : Party
+    auditor     : Party
+    dealId      : Text
+    approve     : Bool
+  where
+    signatory investor
+    observer fundManager, auditor
+    -- SENGAJA tidak ada investor lain di observer — ini mekanisme privasi individualnya
+
+    -- Satu investor cuma boleh punya satu Vote aktif per deal.
+    key (investor, fundManager, dealId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- Dipakai `TallyVotes`: FundManager tidak punya otoritas signatory atas Vote,
+    -- jadi Vote di-archive lewat consuming choice dengan controller FundManager.
+    choice ConsumeVote : Bool
+      controller fundManager
+      do
+        pure approve
+
+-- | Bukti bahwa seorang investor SUDAH vote (tanpa isi pilihannya), dibuat
+-- `CastVote` dan di-archive `TallyVotes`. Key-nya dipegang FundManager supaya
+-- `TallyVotes` bisa memastikan tidak ada vote yang dibuang — key `Vote` dipegang
+-- investor, jadi FundManager tidak berwenang mengecek "vote ini tidak ada".
+-- Visibility sama seperti Vote: investor lain tidak ikut melihat.
+template VoteReceipt
+  with
+    fundManager : Party
+    investor    : Party
+    auditor     : Party
+    dealId      : Text
+  where
+    signatory fundManager
+    observer investor, auditor
+
+    key (fundManager, dealId, investor) : (Party, Text, Party)
+    maintainer key._1
+
+-- ---------------------------------------------------------------------------
+-- 3. DealResult (agregat)
+-- ---------------------------------------------------------------------------
+
+template DealResult
+  with
+    fundManager       : Party
+    investors         : [Party]
+    auditor           : Party
+    dealId            : Text
+    description       : Text
+    targetCapital     : Decimal
+    approved          : Bool
+    approveCount      : Int
+    rejectCount       : Int
+    totalVotes        : Int
+    capitalCallIssued : Bool
+  where
+    signatory fundManager
+    observer investors, auditor
+
+    key (fundManager, dealId) : (Party, Text)
+    maintainer key._1
+
+    -- Nonconsuming + `archive self`: CapitalCallNotice per investor tidak boleh
+    -- ter-divulge ke investor lain (lihat catatan privasi di header modul).
+    nonconsuming choice IssueCapitalCall : (ContractId CapitalCallSummary, ContractId FundLedger, [ContractId CapitalCallNotice])
+      with
+        callAmounts : [CallAmount]
+      controller fundManager
+      do
+        assertMsg "Deal must be approved before issuing capital call" approved
+        assertMsg "Capital call has already been issued for this deal" (not capitalCallIssued)
+        assertMsg "Capital call must include at least one investor" (not (null callAmounts))
+        let callInvestors = map (\c -> c.investor) callAmounts
+            totalTarget   = sum (map (\c -> c.amount) callAmounts)
+        assertMsg "Each investor may appear only once" (allDistinct callInvestors)
+        assertMsg "Capital call investor is not part of this deal"
+          (all (`elem` investors) callInvestors)
+        assertMsg "Capital call amounts must be positive" (all (\c -> c.amount > 0.0) callAmounts)
+        -- BUSINESSRULES.md bagian 4: total capital call tidak boleh melebihi target deal
+        assertMsg "Total capital call must not exceed the deal target capital" (totalTarget <= targetCapital)
+
+        archive self
+        _ <- create this with capitalCallIssued = True
+
+        notices <- forA callAmounts $ \c ->
+          create CapitalCallNotice with
+            fundManager
+            investor = c.investor
+            auditor
+            dealId
+            amount = c.amount
+        summary <- create CapitalCallSummary with
+          fundManager
+          investors
+          auditor
+          dealId
+          totalTarget
+          totalCollected = 0.0
+        ledger <- create FundLedger with
+          fundManager
+          investors
+          auditor
+          dealId
+          totalContributed = 0.0
+        pure (summary, ledger, notices)
+
+-- ---------------------------------------------------------------------------
+-- 4. CapitalCallNotice (privat per-investor)
+-- ---------------------------------------------------------------------------
+
+template CapitalCallNotice
+  with
+    fundManager : Party
+    investor    : Party
+    auditor     : Party
+    dealId      : Text
+    amount      : Decimal
+  where
+    signatory fundManager
+    observer investor, auditor
+    -- BUKAN observer investor lain — nominal setoran tiap LP privat
+    ensure amount > 0.0
+
+    -- Setor penuh sesuai notice. FundLedger & CapitalCallSummary dicari lewat
+    -- contract key, jadi frontend cukup exercise choice ini tanpa argumen.
+    choice Contribute : ContractId Contribution
+      controller investor
+      do
+        contributionCid <- create Contribution with
+          fundManager
+          investor
+          auditor
+          dealId
+          amount
+        _ <- exerciseByKey @FundLedger (fundManager, dealId) RecordContribution with amount
+        _ <- exerciseByKey @CapitalCallSummary (fundManager, dealId) RecordCollected with amount
+        pure contributionCid
+
+-- ---------------------------------------------------------------------------
+-- 5. CapitalCallSummary (agregat)
+-- ---------------------------------------------------------------------------
+
+template CapitalCallSummary
+  with
+    fundManager    : Party
+    investors      : [Party]
+    auditor        : Party
+    dealId         : Text
+    totalTarget    : Decimal
+    totalCollected : Decimal
+  where
+    signatory fundManager
+    observer investors, auditor
+    ensure totalTarget > 0.0 && totalCollected >= 0.0 && totalCollected <= totalTarget
+
+    key (fundManager, dealId) : (Party, Text)
+    maintainer key._1
+
+    -- Argumen cuma nominal (tanpa identitas investor) supaya investor lain yang
+    -- melihat update agregat ini tidak tahu siapa yang menyetor.
+    choice RecordCollected : ContractId CapitalCallSummary
+      with
+        amount : Decimal
+      controller fundManager
+      do
+        assertMsg "Amount must be positive" (amount > 0.0)
+        create this with totalCollected = totalCollected + amount
+
+-- ---------------------------------------------------------------------------
+-- 6. Contribution (record privat, dibuat oleh Contribute)
+-- ---------------------------------------------------------------------------
+
+template Contribution
+  with
+    fundManager : Party
+    investor    : Party
+    auditor     : Party
+    dealId      : Text
+    amount      : Decimal
+  where
+    signatory investor
+    observer fundManager, auditor
+    -- Privat, sama seperti CapitalCallNotice — jejak kontribusi individual
+    ensure amount > 0.0
+
+-- ---------------------------------------------------------------------------
+-- 7. FundLedger (agregat, state akumulatif fund)
+-- ---------------------------------------------------------------------------
+
+template FundLedger
+  with
+    fundManager      : Party
+    investors        : [Party]
+    auditor          : Party
+    dealId           : Text
+    totalContributed : Decimal
+    -- Sengaja TIDAK menyimpan breakdown per-investor: kontrak ini visible ke semua
+    -- investor. Proporsi distribusi dihitung dari kontrak Contribution (privat).
+  where
+    signatory fundManager
+    observer investors, auditor
+    ensure totalContributed >= 0.0
+
+    key (fundManager, dealId) : (Party, Text)
+    maintainer key._1
+
+    -- Pola archive + recreate tiap ada Contribution masuk.
+    choice RecordContribution : ContractId FundLedger
+      with
+        amount : Decimal
+      controller fundManager
+      do
+        assertMsg "Amount must be positive" (amount > 0.0)
+        create this with totalContributed = totalContributed + amount
+
+    -- Nonconsuming + `archive self`: DistributionNotice & PlatformFeeRecord tidak
+    -- boleh ter-divulge ke semua investor (lihat catatan privasi di header modul).
+    nonconsuming choice TriggerExit : (ContractId PlatformFeeRecord, ContractId DistributionSummary, [ContractId DistributionNotice])
+      with
+        exitAmount           : Decimal
+        platformAgreementCid : ContractId PlatformAgreement
+        contributionCids     : [ContractId Contribution]
+      controller fundManager
+      do
+        assertMsg "Exit amount must be positive" (exitAmount > 0.0)
+        assertMsg "No capital has been contributed yet" (totalContributed > 0.0)
+        assertMsg "Duplicate contribution contract ids" (allDistinct contributionCids)
+
+        contributions <- forA contributionCids $ \cid -> do
+          c <- fetch cid
+          assertMsg "Contribution belongs to a different deal"
+            (c.fundManager == fundManager && c.dealId == dealId)
+          pure c
+        assertMsg "Contributions do not add up to the FundLedger total"
+          (sum (map (\c -> c.amount) contributions) == totalContributed)
+
+        agreement <- fetch platformAgreementCid
+        assertMsg "Platform agreement belongs to a different fund manager"
+          (agreement.fundManager == fundManager)
+
+        -- 1. Fee Platform (% dari AUM saat exit) dipotong otomatis
+        (feeCid, feeAmount) <- exercise platformAgreementCid RecordPlatformFee with
+          dealId
+          grossAmount = exitAmount
+        let netAmount = exitAmount - feeAmount
+
+        -- 2. Sisa dibagi proporsional sesuai share kontribusi tiap investor
+        --    (kali dulu baru bagi, supaya presisi Decimal terjaga)
+        notices <- forA contributions $ \c ->
+          create DistributionNotice with
+            fundManager
+            investor    = c.investor
+            auditor
+            dealId
+            contributed = c.amount
+            payout      = netAmount * c.amount / totalContributed
+        payouts <- forA notices $ \cid -> do
+          n <- fetch cid
+          pure n.payout
+
+        summary <- create DistributionSummary with
+          fundManager
+          investors
+          auditor
+          dealId
+          totalContributed
+          totalDistributed = sum payouts
+
+        -- Fund ditutup: tidak ada kontribusi/exit lagi untuk deal ini
+        archive self
+        pure (feeCid, summary, notices)
+
+-- ---------------------------------------------------------------------------
+-- 8. PlatformFeeRecord
+-- ---------------------------------------------------------------------------
+
+template PlatformFeeRecord
+  with
+    fundManager : Party
+    platform    : Party
+    auditor     : Party
+    dealId      : Text
+    grossAmount : Decimal
+    feeRate     : Decimal
+    feeAmount   : Decimal
+  where
+    signatory fundManager, platform
+    observer auditor
+    -- BUKAN observer investor — fee ini urusan Platform-FundManager, LP cuma lihat angka net
+
+-- ---------------------------------------------------------------------------
+-- 9. DistributionNotice (privat per-investor)
+-- ---------------------------------------------------------------------------
+
+template DistributionNotice
+  with
+    fundManager : Party
+    investor    : Party
+    auditor     : Party
+    dealId      : Text
+    contributed : Decimal
+    payout      : Decimal
+  where
+    signatory fundManager
+    observer investor, auditor
+
+-- ---------------------------------------------------------------------------
+-- 10. DistributionSummary (agregat)
+-- ---------------------------------------------------------------------------
+
+template DistributionSummary
+  with
+    fundManager      : Party
+    investors        : [Party]
+    auditor          : Party
+    dealId           : Text
+    totalContributed : Decimal
+    totalDistributed : Decimal
+  where
+    signatory fundManager
+    observer investors, auditor

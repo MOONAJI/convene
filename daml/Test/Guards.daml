@@ -1,0 +1,175 @@
+-- | Test aturan bisnis (precondition choice) — semua harus ditolak ledger.
+module Test.Guards where
+
+import DA.Assert
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Convene
+import Test.Common
+
+testInvestorCanVoteOnlyOnce : Script ()
+testInvestorCanVoteOnlyOnce = do
+  ps <- allocateTestParties
+  proposalCid <- proposeDeal ps
+  _ <- castVote proposalCid ps.investor1 True
+  submitMustFail ps.investor1 do
+    exerciseCmd proposalCid CastVote with investor = ps.investor1, approve = False
+
+testNonMemberCannotVote : Script ()
+testNonMemberCannotVote = do
+  ps <- allocateTestParties
+  proposalCid <- proposeDeal ps
+  submitMustFail ps.auditor do
+    exerciseCmd proposalCid CastVote with investor = ps.auditor, approve = True
+
+testCannotVoteOnBehalfOfOtherInvestor : Script ()
+testCannotVoteOnBehalfOfOtherInvestor = do
+  ps <- allocateTestParties
+  proposalCid <- proposeDeal ps
+  submitMustFail ps.investor1 do
+    exerciseCmd proposalCid CastVote with investor = ps.investor2, approve = True
+
+testCannotVoteAfterDeadline : Script ()
+testCannotVoteAfterDeadline = do
+  ps <- allocateTestParties
+  proposalCid <- proposeDeal ps
+  passTime (days 8)
+  submitMustFail ps.investor1 do
+    exerciseCmd proposalCid CastVote with investor = ps.investor1, approve = True
+
+-- | Tally ditolak selama voting masih terbuka & belum semua vote; boleh setelah deadline.
+testTallyWaitsForDeadlineOrAllVotes : Script ()
+testTallyWaitsForDeadlineOrAllVotes = do
+  ps <- allocateTestParties
+  proposalCid <- proposeDeal ps
+  v1 <- castVote proposalCid ps.investor1 True
+  v2 <- castVote proposalCid ps.investor2 True
+  submitMustFail ps.fundManager do
+    exerciseCmd proposalCid TallyVotes with voteCids = [v1, v2]
+  passTime (days 8)
+  _ <- tallyVotes ps proposalCid [v1, v2]
+  pure ()
+
+-- | Setelah deadline, FundManager tidak boleh membuang Vote yang sudah masuk
+-- (mis. cuma menyertakan vote setuju supaya deal lolos).
+testTallyMustIncludeAllCastVotes : Script ()
+testTallyMustIncludeAllCastVotes = do
+  ps <- allocateTestParties
+  proposalCid <- proposeDeal ps
+  v1 <- castVote proposalCid ps.investor1 True
+  v2 <- castVote proposalCid ps.investor2 False
+  v3 <- castVote proposalCid ps.investor3 False
+  passTime (days 8)
+  submitMustFail ps.fundManager do
+    exerciseCmd proposalCid TallyVotes with voteCids = [v1]
+  resultCid <- tallyVotes ps proposalCid [v1, v2, v3]
+  Some result <- queryContractId ps.fundManager resultCid
+  result.approved === False
+  result.totalVotes === 3
+
+testTallyRejectsDuplicateVoteIds : Script ()
+testTallyRejectsDuplicateVoteIds = do
+  ps <- allocateTestParties
+  proposalCid <- proposeDeal ps
+  [v1, _, _] <- castDefaultVotes ps proposalCid
+  submitMustFail ps.fundManager do
+    exerciseCmd proposalCid TallyVotes with voteCids = [v1, v1, v1]
+
+testRejectedDealCannotIssueCapitalCall : Script ()
+testRejectedDealCannotIssueCapitalCall = do
+  ps <- allocateTestParties
+  proposalCid <- proposeDeal ps
+  v1 <- castVote proposalCid ps.investor1 False
+  v2 <- castVote proposalCid ps.investor2 False
+  v3 <- castVote proposalCid ps.investor3 True
+  resultCid <- tallyVotes ps proposalCid [v1, v2, v3]
+  submitMustFail ps.fundManager do
+    exerciseCmd resultCid IssueCapitalCall with callAmounts = defaultCallAmounts ps
+
+testCapitalCallOnlyOnce : Script ()
+testCapitalCallOnlyOnce = do
+  deal <- runToApprovedDeal
+  let ps = deal.parties
+  _ <- issueCapitalCall ps deal.resultCid
+  [(resultCid', result')] <- query @DealResult ps.fundManager
+  assertMsg "DealResult should be marked as issued" result'.capitalCallIssued
+  submitMustFail ps.fundManager do
+    exerciseCmd resultCid' IssueCapitalCall with callAmounts = defaultCallAmounts ps
+
+-- | Total capital call boleh <= target, tapi tidak boleh melebihi target.
+testCapitalCallCannotExceedTarget : Script ()
+testCapitalCallCannotExceedTarget = do
+  deal <- runToApprovedDeal
+  let ps = deal.parties
+      overTarget = map (\inv -> CallAmount with investor = inv, amount = 100001.0) (investorsOf ps)
+  submitMustFail ps.fundManager do
+    exerciseCmd deal.resultCid IssueCapitalCall with callAmounts = overTarget
+  (summaryCid, _, noticeCids) <- submit ps.fundManager do
+    exerciseCmd deal.resultCid IssueCapitalCall with
+      callAmounts = [CallAmount with investor = ps.investor1, amount = 1000.0]
+  length noticeCids === 1
+  Some summary <- queryContractId ps.fundManager summaryCid
+  summary.totalTarget === 1000.0
+
+-- | Proposal dengan deadline di masa lalu tidak bisa di-vote dan otomatis Rejected.
+testPastDeadlineProposalIsUseless : Script ()
+testPastDeadlineProposalIsUseless = do
+  ps <- allocateTestParties
+  passTime (days 30)
+  now <- getTime
+  proposalCid <- submit ps.fundManager do
+    createCmd DealProposal with
+      fundManager   = ps.fundManager
+      investors     = investorsOf ps
+      auditor       = ps.auditor
+      dealId        = "deal-past"
+      description   = "Deadline sudah lewat"
+      targetCapital = testTargetCapital
+      voteDeadline  = addRelTime now (days (-1))
+  submitMustFail ps.investor1 do
+    exerciseCmd proposalCid CastVote with investor = ps.investor1, approve = True
+  resultCid <- tallyVotes ps proposalCid []
+  Some result <- queryContractId ps.fundManager resultCid
+  result.approved === False
+  result.totalVotes === 0
+
+-- | Seri = Rejected (simple majority harus > 50% suara masuk).
+testTieIsRejected : Script ()
+testTieIsRejected = do
+  ps <- allocateTestParties
+  proposalCid <- proposeDeal ps
+  v1 <- castVote proposalCid ps.investor1 True
+  v2 <- castVote proposalCid ps.investor2 False
+  passTime (days 8)
+  resultCid <- tallyVotes ps proposalCid [v1, v2]
+  Some result <- queryContractId ps.fundManager resultCid
+  result.approved === False
+
+testInvestorCannotContributeTwice : Script ()
+testInvestorCannotContributeTwice = do
+  deal <- runToApprovedDeal
+  let ps = deal.parties
+  _ <- issueCapitalCall ps deal.resultCid
+  [(noticeCid, _)] <- query @CapitalCallNotice ps.investor1
+  _ <- submit ps.investor1 do exerciseCmd noticeCid Contribute
+  submitMustFail ps.investor1 do exerciseCmd noticeCid Contribute
+
+testExitRequiresAllContributions : Script ()
+testExitRequiresAllContributions = do
+  deal <- runToFundedDeal
+  submitMustFail deal.parties.fundManager do
+    exerciseCmd deal.fundLedgerCid TriggerExit with
+      exitAmount           = testExitAmount
+      platformAgreementCid = deal.agreementCid
+      contributionCids     = drop 1 deal.contributionCids
+
+testExitOnlyOnce : Script ()
+testExitOnlyOnce = do
+  deal <- runToFundedDeal
+  _ <- triggerExit deal
+  submitMustFail deal.parties.fundManager do
+    exerciseCmd deal.fundLedgerCid TriggerExit with
+      exitAmount           = testExitAmount
+      platformAgreementCid = deal.agreementCid
+      contributionCids     = deal.contributionCids

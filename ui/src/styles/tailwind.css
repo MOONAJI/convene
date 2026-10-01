@@ -1,0 +1,46 @@
+/* Sumber Tailwind. Output di-generate ke src/styles/generated.css (jangan diedit manual). */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-bg text-ink font-sans antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+  ::selection {
+    @apply bg-privacy text-ink;
+  }
+  :focus-visible {
+    outline: 2px solid #F2EFE9;
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  .num {
+    @apply font-display;
+    font-variant-numeric: tabular-nums;
+  }
+  .field {
+    @apply w-full rounded-md border border-border bg-bg px-3 py-2 text-sm text-ink placeholder-disabled;
+  }
+  .field:focus {
+    @apply border-muted outline-none;
+  }
+  .skeleton {
+    @apply rounded-sm bg-surface-2;
+    animation: skeleton-pulse 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes skeleton-pulse {
+  50% { opacity: 0.45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton { animation: none; }
+}

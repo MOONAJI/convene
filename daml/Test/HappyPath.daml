@@ -1,0 +1,115 @@
+-- | Skenario end-to-end happy path: 1 FundManager, 3 Investor, 1 Auditor, 1 Platform.
+-- Propose -> Vote -> Tally -> Capital Call -> Contribute -> Trigger Exit -> Distribution.
+module Test.HappyPath where
+
+import DA.Assert
+import DA.Optional (fromSomeNote)
+import Daml.Script
+
+import Convene
+import Test.Common
+
+happyPath : Script ()
+happyPath = do
+  ps <- allocateTestParties
+  agreementCid <- setupPlatformAgreement ps
+
+  -- 1. Propose deal
+  proposalCid <- proposeDeal ps
+
+  -- 2. Vote (2 setuju, 1 menolak)
+  voteCids <- castDefaultVotes ps proposalCid
+
+  -- 3. Tally -> DealResult agregat
+  resultCid <- tallyVotes ps proposalCid voteCids
+  result <- fromSomeNote "DealResult missing" <$> queryContractId ps.fundManager resultCid
+  result.approved === True
+  result.approveCount === 2
+  result.rejectCount === 1
+  result.totalVotes === 3
+  proposals <- query @DealProposal ps.fundManager
+  proposals === []
+  votesLeft <- query @Vote ps.fundManager
+  votesLeft === []
+
+  -- 4. Capital call -> 3 notice privat + summary + ledger kosong
+  (summaryCid, fundLedgerCid, noticeCids) <- issueCapitalCall ps resultCid
+  length noticeCids === 3
+  summary <- fromSomeNote "CapitalCallSummary missing" <$> queryContractId ps.fundManager summaryCid
+  summary.totalTarget === testTargetCapital
+  summary.totalCollected === 0.0
+  ledger0 <- fromSomeNote "FundLedger missing" <$> queryContractId ps.fundManager fundLedgerCid
+  ledger0.totalContributed === 0.0
+
+  -- 5. Contribute oleh tiap investor
+  contributionCids <- contributeAll ps
+  length contributionCids === 3
+  [(fundLedgerCid', ledger)] <- query @FundLedger ps.fundManager
+  ledger.totalContributed === testTargetCapital
+  [(_, summary')] <- query @CapitalCallSummary ps.fundManager
+  summary'.totalCollected === testTargetCapital
+  remainingNotices <- query @CapitalCallNotice ps.fundManager
+  remainingNotices === []
+
+  -- 6. Trigger exit -> fee Platform 1% + distribusi proporsional
+  (feeCid, distSummaryCid, distNoticeCids) <- triggerExit FundedDeal with
+    parties = ps
+    agreementCid
+    fundLedgerCid = fundLedgerCid'
+    contributionCids
+
+  fee <- fromSomeNote "PlatformFeeRecord missing" <$> queryContractId ps.platform feeCid
+  fee.grossAmount === testExitAmount
+  fee.feeAmount === 4500.0
+
+  distSummary <- fromSomeNote "DistributionSummary missing" <$> queryContractId ps.investor1 distSummaryCid
+  distSummary.totalContributed === testTargetCapital
+  distSummary.totalDistributed === 445500.0
+
+  length distNoticeCids === 3
+  payouts <- forA (investorsOf ps) $ \inv -> do
+    [(_, n)] <- query @DistributionNotice inv
+    n.investor === inv
+    n.contributed === callAmountPerInvestor
+    pure n.payout
+  payouts === [148500.0, 148500.0, 148500.0]
+
+  -- Fund ditutup setelah exit
+  ledgersAfterExit <- query @FundLedger ps.fundManager
+  ledgersAfterExit === []
+  pure ()
+
+-- | Kontribusi tidak rata, rasio sama dengan demo UI (40/30/30 = 100k/75k/75k), exit 740k.
+-- Fee 1% dihitung dari exit PENUH (7.400), sisa 732.600 dibagi 40/30/30 —
+-- bukan dibagi rata per kepala.
+testProportionalDistribution : Script ()
+testProportionalDistribution = do
+  deal <- runToApprovedDeal
+  let ps = deal.parties
+  _ <- submit ps.fundManager do
+    exerciseCmd deal.resultCid IssueCapitalCall with
+      callAmounts =
+        [ CallAmount with investor = ps.investor1, amount = 100000.0
+        , CallAmount with investor = ps.investor2, amount = 75000.0
+        , CallAmount with investor = ps.investor3, amount = 75000.0 ]
+  contributionCids <- contributeAll ps
+  [(fundLedgerCid, _)] <- query @FundLedger ps.fundManager
+  (feeCid, distSummaryCid, _) <- submit ps.fundManager do
+    exerciseCmd fundLedgerCid TriggerExit with
+      exitAmount           = 740000.0
+      platformAgreementCid = deal.agreementCid
+      contributionCids
+
+  fee <- fromSomeNote "PlatformFeeRecord missing" <$> queryContractId ps.auditor feeCid
+  fee.grossAmount === 740000.0
+  fee.feeRate === defaultPlatformFeeRate
+  fee.feeAmount === 7400.0
+
+  payouts <- forA (investorsOf ps) $ \inv -> do
+    [(_, n)] <- query @DistributionNotice inv
+    pure n.payout
+  payouts === [293040.0, 219780.0, 219780.0]
+
+  distSummary <- fromSomeNote "DistributionSummary missing" <$> queryContractId ps.investor2 distSummaryCid
+  distSummary.totalContributed === 250000.0
+  distSummary.totalDistributed === 732600.0

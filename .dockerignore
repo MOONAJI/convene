@@ -1,0 +1,25 @@
+# Frontend gak dibutuhin sama image backend ini sama sekali
+ui/
+
+# Build artifact & cache lokal (biar Docker build dari daml.yaml yang fresh, bukan sisa .dar lama)
+.daml/
+*.dar
+
+# Dependency lain yang mungkin nyasar ke root
+node_modules/
+
+# Version control — bisa gede banget kalau kebawa, apalagi dengan history
+.git/
+.gitignore
+
+# Env & secrets
+.env
+.env.local
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+.idea/
+
+# Dokumen markdown gak perlu ikut ke image
+*.md

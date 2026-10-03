@@ -6,10 +6,11 @@ export PORT="${PORT:-7575}"
 export ALLOWED_ORIGIN="${ALLOWED_ORIGIN:-https://convene-eight.vercel.app}"
 JSON_API_PORT=7576
 
-# Batas heap per JVM (bisa di-override lewat Railway Variables)
-SANDBOX_JVM_OPTS="${SANDBOX_JVM_OPTS:--Xms64m -Xmx300m -XX:+UseSerialGC}"
-SCRIPT_JVM_OPTS="${SCRIPT_JVM_OPTS:--Xmx256m -XX:+UseSerialGC}"
-JSONAPI_JVM_OPTS="${JSONAPI_JVM_OPTS:--Xms32m -Xmx200m -XX:+UseSerialGC}"
+# Pengetatan memory (target: muat di 1GB Railway Trial)
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+SANDBOX_JVM_OPTS="${SANDBOX_JVM_OPTS:--Xms64m -Xmx300m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -XX:ReservedCodeCacheSize=96m}"
+SCRIPT_JVM_OPTS="${SCRIPT_JVM_OPTS:--Xmx256m -XX:+UseSerialGC -XX:TieredStopAtLevel=1}"
+JSONAPI_JVM_OPTS="${JSONAPI_JVM_OPTS:--Xms32m -Xmx200m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -XX:ReservedCodeCacheSize=64m}"
 
 SANDBOX_PID=""; CADDY_PID=""; JSONAPI_PID=""
 cleanup() { kill $SANDBOX_PID $CADDY_PID $JSONAPI_PID 2>/dev/null || true; }

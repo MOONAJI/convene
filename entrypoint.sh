@@ -2,7 +2,13 @@
 set -e
 
 DAR=$(find .daml/dist -name "*.dar" | head -n 1)
-PORT="${PORT:-7575}"
+
+# Port publik (dibaca Caddy). Railway mengisi PORT, default 7575 untuk lokal.
+export PORT="${PORT:-7575}"
+# Domain frontend yang boleh memanggil API ini (tanpa garis miring di akhir).
+export ALLOWED_ORIGIN="${ALLOWED_ORIGIN:-https://convene-eight.vercel.app}"
+# Port internal JSON API, cuma bisa diakses dari dalam container.
+JSON_API_PORT=7576
 
 echo "Starting Canton Sandbox..."
 daml sandbox --dar "$DAR" --port 6865 &
@@ -32,9 +38,12 @@ until daml script \
   sleep 3
 done
 
-echo "Starting JSON API on port $PORT..."
+echo "Starting Caddy on port $PORT (CORS for $ALLOWED_ORIGIN) -> JSON API on 127.0.0.1:$JSON_API_PORT..."
+caddy run --config /app/Caddyfile --adapter caddyfile &
+
+echo "Starting JSON API on 127.0.0.1:$JSON_API_PORT..."
 exec daml json-api \
   --ledger-host localhost --ledger-port 6865 \
-  --http-port "$PORT" \
-  --address 0.0.0.0 \
+  --http-port "$JSON_API_PORT" \
+  --address 127.0.0.1 \
   --allow-insecure-tokens

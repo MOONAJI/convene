@@ -3,6 +3,7 @@ import DamlLedger from "@daml/react";
 import LoginScreen from "./LoginScreen";
 import Workspace from "./Workspace";
 import { Session, loadSession, login, saveSession } from "../lib/session";
+import { httpBaseUrl, wsBaseUrl } from "../lib/config";
 
 const App: React.FC = () => {
   const [session, setSession] = useState<Session>();
@@ -42,7 +43,13 @@ const App: React.FC = () => {
   if (!session) return <LoginScreen onLogin={signIn} />;
 
   return (
-    <DamlLedger token={session.token} party={session.party} user={{ userId: session.userId, primaryParty: session.party }}>
+    <DamlLedger
+      token={session.token}
+      party={session.party}
+      user={{ userId: session.userId, primaryParty: session.party }}
+      httpBaseUrl={httpBaseUrl}
+      wsBaseUrl={wsBaseUrl}
+    >
       <Workspace session={session} onSignOut={signOut} />
     </DamlLedger>
   );

@@ -1,0 +1,19 @@
+{
+	admin off
+	auto_https off
+}
+
+:{$PORT} {
+	header {
+		Access-Control-Allow-Origin "{$ALLOWED_ORIGIN}"
+		Access-Control-Allow-Methods "GET, POST, OPTIONS"
+		Access-Control-Allow-Headers "Authorization, Content-Type"
+		Access-Control-Max-Age "86400"
+		Vary "Origin"
+	}
+
+	@preflight method OPTIONS
+	respond @preflight 204
+
+	reverse_proxy 127.0.0.1:7576
+}

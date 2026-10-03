@@ -18,3 +18,7 @@ RUN chmod +x entrypoint.sh
 
 EXPOSE 7575
 CMD ["./entrypoint.sh"]
+
+# Caddy: reverse proxy kecil untuk header CORS (binary diambil dari image resmi)
+COPY --from=caddy:2 /usr/bin/caddy /usr/bin/caddy
+COPY Caddyfile ./

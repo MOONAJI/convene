@@ -1,6 +1,7 @@
 import { encode } from "jwt-simple";
 import Ledger from "@daml/ledger";
 import { RoleKey, roleForUserId } from "./roles";
+import { httpBaseUrl, wsBaseUrl } from "./config";
 
 // Login dev (BE.md bagian 2): JWT tanpa tanda tangan yang valid, sub = Ledger API
 // User ID. JSON API sandbox tidak memverifikasi signature, jadi "secret" cukup.
@@ -18,7 +19,7 @@ export const makeToken = (userId: string): string =>
 
 export const login = async (userId: string): Promise<Session> => {
   const token = makeToken(userId);
-  const ledger = new Ledger({ token });
+  const ledger = new Ledger({ token, httpBaseUrl, wsBaseUrl });
   const user = await ledger.getUser();
   if (!user.primaryParty) {
     throw new Error(`User "${userId}" has no primary party on this ledger.`);
